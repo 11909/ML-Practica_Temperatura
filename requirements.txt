@@ -1,0 +1,6 @@
+pandas>=3.0
+numpy>=2.0
+scikit-learn>=1.5
+meteostat>=2.1
+requests>=2.31
+matplotlib>=3.8
