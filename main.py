@@ -170,6 +170,46 @@ def fetch_power():
     return _guardar_cache(cache, s, vieja, "NASA POWER")
 
 
+def _serie_openmeteo(j):
+    h = j["hourly"]
+    s = pd.Series(h["temperature_2m"], index=pd.to_datetime(h["time"]), dtype=float).dropna()
+    s.index = s.index + UTC_OFFSET
+    return s.sort_index()
+
+
+def fetch_openmeteo():
+    """Open-Meteo, archivo histórico (reanálisis ERA5/ERA5-Land, malla ~9-25 km con ajuste por
+    altitud), T2M horaria en UTC. Como NASA POWER, es un modelo de malla: sirve como
+    verificación independiente, no como observación del sitio."""
+    cache = DATA / f"openmeteo_{LAT:.3f}_{LON:.3f}.csv"
+    vieja, desde = _leer_cache(cache, MS_START)
+    if desde is None:
+        return vieja
+    r = requests.get("https://archive-api.open-meteo.com/v1/archive",
+                     params={"latitude": LAT, "longitude": LON, "hourly": "temperature_2m",
+                             "timezone": "GMT", "start_date": f"{desde}-01-01",
+                             "end_date": datetime.now().strftime("%Y-%m-%d")},
+                     timeout=180)
+    r.raise_for_status()
+    return _guardar_cache(cache, _serie_openmeteo(r.json()), vieja, "Open-Meteo")
+
+
+def fetch_openmeteo_pronostico():
+    """Pronóstico numérico de Open-Meteo (combinación 'best_match' de modelos) para el día
+    objetivo. Sólo existe si OBJETIVO cae dentro de su rango (~3 meses atrás a 16 días)."""
+    dia = OBJETIVO.strftime("%Y-%m-%d")
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast",
+                         params={"latitude": LAT, "longitude": LON, "hourly": "temperature_2m",
+                                 "timezone": "GMT", "start_date": dia, "end_date": dia},
+                         timeout=60)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  Open-Meteo: sin pronóstico para {dia} ({e})")
+        return None
+    return _serie_openmeteo(r.json())
+
+
 # ----------------------------------------------------------------------------- utilidades
 def a_30min(s):
     """Lleva una serie horaria a una rejilla de 30 min (interpola sólo huecos de 1 paso)."""
@@ -479,12 +519,14 @@ def predecir_objetivo(serie, ema, tipo):
 
 
 def main():
-    pd.set_option("display.width", 140)
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", None)
     pd.set_option("display.precision", 2)
 
     print("Cargando datos...")
     ema = load_ema()
-    completas = {"Meteostat": fetch_meteostat(), "NASA POWER": fetch_power()}
+    completas = {"Meteostat": fetch_meteostat(), "NASA POWER": fetch_power(),
+                 "Open-Meteo": fetch_openmeteo()}
     print(f"EMA: {ema.index.min()} -> {ema.index.max()} ({len(ema)} registros)")
     for k, s in completas.items():
         print(f"{k}: {s.index.min()} -> {s.index.max()} ({len(s)} horas)")
@@ -536,18 +578,28 @@ def main():
                           "p10": res_ms["pred"] - 1.2816 * sd_total,
                           "p90": res_ms["pred"] + 1.2816 * sd_total,
                           "verif_POWER": resultados["NASA POWER"][0]["pred"],
+                          "verif_OpenMeteo": resultados["Open-Meteo"][0]["pred"],
                           "sesgo_local": res_ms["sesgo_local"],
                           "sin_sesgo_local": res_ms["pred"] - PESO_SESGO * res_ms["sesgo_local"]},
                          index=HORAS)
     # Observación de Meteostat en el día objetivo, si ya está disponible
     obs = a_30min(completas["Meteostat"]).reindex(tiempos_objetivo(OBJETIVO))
     final["obs_Meteostat"] = obs.values
+    # Pronóstico numérico de Open-Meteo para el día, crudo y corregido con el sesgo local
+    # EMA - Open-Meteo (medido igual que el de Meteostat)
+    t = tiempos_objetivo(OBJETIVO)
+    nwp = fetch_openmeteo_pronostico()
+    nwp = a_30min(nwp).reindex(t).values if nwp is not None else np.full(len(t), np.nan)
+    sesgo_om = aplicar_sesgo(resultados["Open-Meteo"][1]["coef"], t)
+    final["NWP_OpenMeteo_crudo"] = nwp
+    final["NWP_OpenMeteo"] = nwp + PESO_SESGO * sesgo_om
     print(f"\n========== PRONÓSTICO {ETQ}-{OBJETIVO.year} | {SITIO} "
           f"({LAT:.4f}, {LON:.4f}, {ELEV} m) ==========")
-    print(final[["pred", "p10", "p90", "verif_POWER", "sin_sesgo_local",
-                 "obs_Meteostat"]].round(1))
-    print("(p10-p90 = intervalo del 80%; sin_sesgo_local = pronóstico para el Aeropuerto;"
-          " obs_Meteostat = lo observado ese día en el Aeropuerto, si ya existe)")
+    print(final[["pred", "p10", "p90", "verif_POWER", "verif_OpenMeteo", "NWP_OpenMeteo",
+                 "NWP_OpenMeteo_crudo", "sin_sesgo_local", "obs_Meteostat"]].round(1))
+    print("(p10-p90 = intervalo del 80%; NWP_OpenMeteo = pronóstico numérico de Open-Meteo"
+          " corregido al sitio (crudo = tal cual lo da la API); sin_sesgo_local = pronóstico"
+          " para el Aeropuerto; obs_Meteostat = lo observado ese día en el Aeropuerto)")
     sens = pd.DataFrame({f"peso {w:.1f}": final["sin_sesgo_local"] + w * final["sesgo_local"]
                          for w in (0.0, 0.5, 1.0)})
     print("\nSensibilidad al peso del sesgo local (PESO_SESGO):")
