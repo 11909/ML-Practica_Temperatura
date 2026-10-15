@@ -2,9 +2,9 @@
 Predicción de temperatura - Edificio de Gobierno de la ESCOM-IPN, Zacatenco, CDMX
 Objetivo: temperatura del aire el día OBJETIVO (15 de octubre de 2026) a las 07:00, 07:30, 08:00 y 08:30
 en el punto 19.505277, -99.146525 (2240 m), a ~0.8 km de la EMA ENCB II.
-Meteostat no tiene estación en la ESCOM: sus estaciones más cercanas (Aeropuerto, Tacubaya)
-se usan sólo como fuente de historia larga, y el sesgo local (EMA ENCB II) traslada el
-pronóstico de esa fuente al sitio.
+Fuente principal (PRINCIPAL): Open-Meteo, malla de modelo en las coordenadas del sitio.
+Meteostat (estaciones Aeropuerto/Tacubaya) y NASA POWER se usan como verificación. El sesgo
+local (EMA ENCB II - fuente) puede trasladar el pronóstico de la malla al sitio (PESO_SESGO).
 
 Idea general (ver README.md):
     pronóstico = climatología(fecha, hora)      <- regresión entrenada con años de datos horarios
@@ -45,9 +45,13 @@ VENTANA_ANOM = 21          # días usados para medir la anomalía reciente
 HORAS_MANANA = (6.0, 9.0)  # franja horaria relevante (horas decimales)
 ANIOS_VALIDACION = range(2018, 2026)
 VENTANA_VAL = 7            # la validación usa los días OBJETIVO ± VENTANA_VAL de cada año
-# Fracción del sesgo local (EMA - Meteostat) que se aplica al pronóstico: 1 = todo, 0 = nada.
-# El sesgo sólo pudo medirse con la EMA de jul-ago 2026; ver incertidumbre_traslado().
-PESO_SESGO = 1.0
+# Fuente con la que se valida y se emite el pronóstico: "Open-Meteo", "Meteostat" o "NASA POWER"
+PRINCIPAL = "Open-Meteo"
+# Fracción del sesgo local (EMA - fuente principal) que se aplica: 1 = todo, 0 = nada.
+# El sesgo sólo pudo medirse con la EMA de jul-ago 2026 (para Open-Meteo, ~+5.6 °C en las
+# mañanas); con 0 el pronóstico queda como el de la malla de Open-Meteo, sin corrección al
+# sitio. Ver incertidumbre_traslado().
+PESO_SESGO = 0.0
 MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
 
 
@@ -383,14 +387,14 @@ def ajustar_sesgo(dif):
     return coef, sd
 
 
-def incertidumbre_traslado(ms_serie, pw_serie, meses_ema):
+def incertidumbre_traslado(serie_a, serie_b, meses_ema):
     """El sesgo local se midió en los meses de la EMA y se aplica en el mes del objetivo.
     ¿Cuánto cambia de una temporada a otra la diferencia matutina entre dos sitios del valle?
-    Se mide con un par que sí tiene años de datos (Meteostat - NASA POWER): para cada año,
+    Se mide con un par que sí tiene años de datos (p. ej. Meteostat - Open-Meteo): para cada año,
     diferencia(mes objetivo) - diferencia(meses de la EMA). Devuelve su media cuadrática,
     que se suma como incertidumbre extra del sesgo."""
-    comun = ms_serie.index.intersection(pw_serie.index)
-    d = ms_serie[comun] - pw_serie[comun]
+    comun = serie_a.index.intersection(serie_b.index)
+    d = serie_a[comun] - serie_b[comun]
     d = d[es_manana(d.index)]
     tabla = d.groupby([d.index.year, d.index.month]).mean().unstack()
     meses = [mm for mm in meses_ema if mm in tabla.columns]
@@ -434,18 +438,18 @@ def prueba_sesgo_ema(ema, serie):
 
 
 # ----------------------------------------------------------------------------- gráficas
-def graficas(ema, ms_serie, final, val, dif_ms, coef_ms):
+def graficas(ema, serie_principal, final, val, dif_ms, coef_ms):
     OUT.mkdir(exist_ok=True)
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
 
     ax = axes[0, 0]
-    s30 = a_30min(ms_serie)
+    s30 = a_30min(serie_principal)
     ini, fin = ema.index.min().normalize(), ema.index.max()
     ciclo_ema = ema.groupby(hora_decimal(ema.index)).mean()
     sel = s30.loc[ini:fin]
     ciclo_ms = sel.groupby(hora_decimal(sel.index)).mean()
     ax.plot(ciclo_ema.index, ciclo_ema.values, color="#2b6cb0", label="EMA ENCB II")
-    ax.plot(ciclo_ms.index, ciclo_ms.values, color="#a0aec0", label="Meteostat (Aeropuerto)")
+    ax.plot(ciclo_ms.index, ciclo_ms.values, color="#a0aec0", label=PRINCIPAL)
     ax.axvspan(7, 8.5, color="#ed8936", alpha=.15, label="horas objetivo")
     ax.set_title(f"Ciclo diario medio {ini.date()} a {fin.date()}")
     ax.set_xlabel("hora (UTC-6)")
@@ -458,7 +462,7 @@ def graficas(ema, ms_serie, final, val, dif_ms, coef_ms):
         hh = pd.Timestamp(f"2000-01-01 {h}")
         s = s30[(s30.index.month == OBJETIVO.month) & (s30.index.day == OBJETIVO.day)
                 & (s30.index.hour == hh.hour) & (s30.index.minute == hh.minute)]
-        ax.plot(s.index.year, s.values, "o-", alpha=.5, color=colores[i], label=f"{h} Meteostat")
+        ax.plot(s.index.year, s.values, "o-", alpha=.5, color=colores[i], label=f"{h} {PRINCIPAL}")
         ax.errorbar(OBJETIVO.year + 0.3 + i * 0.15, final.loc[h, "pred"],
                     yerr=final.loc[h, "pred"] - final.loc[h, "p10"], fmt="s", capsize=3,
                     color=colores[i])
@@ -484,9 +488,9 @@ def graficas(ema, ms_serie, final, val, dif_ms, coef_ms):
     ax.plot(xs, np.polyval(coef_ms, xs), color="k")
     ax.axhline(np.polyval(coef_ms, 0), xmin=0, xmax=.1, color="k")
     elt = elevacion_solar(tiempos_objetivo(OBJETIVO))
-    ax.plot(np.clip(elt, 0, None), final["sesgo_local"], "s", color="#dd6b20",
+    ax.plot(np.clip(elt, 0, None), final["sesgo_completo"], "s", color="#dd6b20",
             label=f"horas objetivo {ETQ}")
-    ax.set_title("Sesgo EMA − Meteostat vs altura del sol (mañanas)")
+    ax.set_title(f"Sesgo EMA − {PRINCIPAL} vs altura del sol (mañanas, peso {PESO_SESGO:.1f})")
     ax.set_xlabel("altura del sol (°)")
     ax.set_ylabel("°C")
     ax.legend()
@@ -533,16 +537,16 @@ def main():
     # Se usan todos los datos hasta justo antes del día objetivo; los del propio día (si ya
     # existen) sólo sirven para comparar, nunca para pronosticar.
     fuentes = {k: s[s.index < OBJETIVO] for k, s in completas.items()}
-    ms_serie = fuentes["Meteostat"]
-    plazo = (OBJETIVO - ms_serie.index.max().normalize()).days
+    prim = fuentes[PRINCIPAL]
+    plazo = (OBJETIVO - prim.index.max().normalize()).days
     print(f"\nPlazo del pronóstico: {plazo} días")
 
-    # 1) Validación: elegir el tipo de regresión con la fuente principal (Meteostat)
-    print(f"\nValidación dejando un año fuera (Meteostat, mañanas {ETQ_VAL}, "
+    # 1) Validación: elegir el tipo de regresión con la fuente principal
+    print(f"\nValidación dejando un año fuera ({PRINCIPAL}, mañanas {ETQ_VAL}, "
           f"{ANIOS_VALIDACION.start}-{ANIOS_VALIDACION.stop - 1})")
     vals = {}
     for tipo in ("ridge", "hgb"):
-        vals[tipo] = validar(ms_serie, tipo, plazo)
+        vals[tipo] = validar(prim, tipo, plazo)
         print(f"\n[{tipo}]  n = {len(vals[tipo])}")
         print(resumen_errores(vals[tipo]))
     mejor = min(vals, key=lambda k: (vals[k].pred - vals[k].real).abs().mean())
@@ -551,12 +555,12 @@ def main():
     sd_modelo = (val.pred - val.real).std()
 
     # 2) ¿El sesgo local se transfiere a días no vistos? (prueba dentro de la EMA)
-    tabla, corte = prueba_sesgo_ema(ema, ms_serie)
+    tabla, corte = prueba_sesgo_ema(ema, prim)
     print(f"\nPrueba del sesgo local en la EMA (ajuste antes de {corte}, prueba después),"
           " 07:00-08:30:")
     print(tabla)
 
-    # 3) Pronóstico con ambas fuentes
+    # 3) Pronóstico con todas las fuentes
     resultados = {}
     for nombre, serie in fuentes.items():
         res, info = predecir_objetivo(serie, ema, mejor)
@@ -566,22 +570,24 @@ def main():
               f" | dispersión del sesgo = {info['sd_sesgo']:.2f} °C ===")
         print(res)
 
-    # Meteostat es la fuente principal (observaciones); POWER (reanálisis de malla gruesa)
-    # funciona como verificación independiente.
-    res_ms, info_ms = resultados["Meteostat"]
-    sd_traslado = incertidumbre_traslado(fuentes["Meteostat"], fuentes["NASA POWER"],
+    # La fuente PRINCIPAL emite el pronóstico; las demás funcionan como verificación.
+    res_p, info_p = resultados[PRINCIPAL]
+    par = "NASA POWER" if PRINCIPAL == "Meteostat" else "Meteostat"
+    sd_traslado = incertidumbre_traslado(fuentes[par], fuentes[PRINCIPAL],
                                          sorted(set(ema.index.month)))
     print(f"\nIncertidumbre por trasladar el sesgo de los meses de la EMA a {ETQ}: "
           f"{sd_traslado:.2f} °C | peso del sesgo aplicado = {PESO_SESGO:.2f}")
-    sd_total = np.sqrt(sd_modelo ** 2 + info_ms["sd_sesgo"] ** 2 + sd_traslado ** 2)
-    final = pd.DataFrame({"pred": res_ms["pred"],
-                          "p10": res_ms["pred"] - 1.2816 * sd_total,
-                          "p90": res_ms["pred"] + 1.2816 * sd_total,
-                          "verif_POWER": resultados["NASA POWER"][0]["pred"],
-                          "verif_OpenMeteo": resultados["Open-Meteo"][0]["pred"],
-                          "sesgo_local": res_ms["sesgo_local"],
-                          "sin_sesgo_local": res_ms["pred"] - PESO_SESGO * res_ms["sesgo_local"]},
-                         index=HORAS)
+    sd_total = np.sqrt(sd_modelo ** 2 + info_p["sd_sesgo"] ** 2 + sd_traslado ** 2)
+    final = pd.DataFrame({"pred": res_p["pred"],
+                          "p10": res_p["pred"] - 1.2816 * sd_total,
+                          "p90": res_p["pred"] + 1.2816 * sd_total}, index=HORAS)
+    otras = [n for n in resultados if n != PRINCIPAL]
+    verifs = [f"verif_{n.replace(' ', '')}" for n in otras]
+    for n, col in zip(otras, verifs):
+        final[col] = resultados[n][0]["pred"]
+    final["sesgo_local"] = PESO_SESGO * res_p["sesgo_local"]      # aplicado
+    final["sesgo_completo"] = res_p["sesgo_local"]                # estimado con la EMA
+    final["sin_sesgo_local"] = res_p["pred"] - final["sesgo_local"]
     # Observación de Meteostat en el día objetivo, si ya está disponible
     obs = a_30min(completas["Meteostat"]).reindex(tiempos_objetivo(OBJETIVO))
     final["obs_Meteostat"] = obs.values
@@ -595,12 +601,13 @@ def main():
     final["NWP_OpenMeteo"] = nwp + PESO_SESGO * sesgo_om
     print(f"\n========== PRONÓSTICO {ETQ}-{OBJETIVO.year} | {SITIO} "
           f"({LAT:.4f}, {LON:.4f}, {ELEV} m) ==========")
-    print(final[["pred", "p10", "p90", "verif_POWER", "verif_OpenMeteo", "NWP_OpenMeteo",
-                 "NWP_OpenMeteo_crudo", "sin_sesgo_local", "obs_Meteostat"]].round(1))
-    print("(p10-p90 = intervalo del 80%; NWP_OpenMeteo = pronóstico numérico de Open-Meteo"
-          " corregido al sitio (crudo = tal cual lo da la API); sin_sesgo_local = pronóstico"
-          " para el Aeropuerto; obs_Meteostat = lo observado ese día en el Aeropuerto)")
-    sens = pd.DataFrame({f"peso {w:.1f}": final["sin_sesgo_local"] + w * final["sesgo_local"]
+    print(final[["pred", "p10", "p90", *verifs, "NWP_OpenMeteo", "NWP_OpenMeteo_crudo",
+                 "obs_Meteostat"]].round(1))
+    print(f"(fuente principal: {PRINCIPAL}, peso del sesgo = {PESO_SESGO:.1f}; p10-p90 = intervalo"
+          " del 80%; verif_* = mismo método con otra fuente; NWP_OpenMeteo = pronóstico numérico"
+          " de Open-Meteo con el mismo peso de sesgo (crudo = tal cual lo da la API);"
+          " obs_Meteostat = lo observado ese día en el Aeropuerto)")
+    sens = pd.DataFrame({f"peso {w:.1f}": final["sin_sesgo_local"] + w * final["sesgo_completo"]
                          for w in (0.0, 0.5, 1.0)})
     print("\nSensibilidad al peso del sesgo local (PESO_SESGO):")
     print(sens.round(1))
@@ -608,7 +615,7 @@ def main():
     OUT.mkdir(exist_ok=True)
     final.round(2).to_csv(OUT / f"prediccion_{OBJETIVO.strftime('%Y%m%d')}.csv")
     val.to_csv(OUT / "validacion.csv", index=False)
-    graficas(ema, ms_serie, final, val, info_ms["dif"], info_ms["coef"])
+    graficas(ema, prim, final, val, info_p["dif"], info_p["coef"])
     print(f"\nArchivos en {OUT}")
 
 
